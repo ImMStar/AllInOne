@@ -28,6 +28,10 @@ class Health(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"ok")
 
+    def do_HEAD(self):  # UptimeRobot checks with HEAD requests
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, *a):
         pass
 
