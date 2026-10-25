@@ -152,19 +152,64 @@ def remember(context, key: str, st: dict):
         msgs.pop(next(iter(msgs)))
 
 
-async def refresh(bot, chat_id: int, message_id: int, st: dict):
-    """Re-render the caption + keyboard on the bot's media message."""
+def media_of(m):
+    """Return (kind, file_id) for the media in a message."""
+    if m.animation:
+        return "animation", m.animation.file_id
+    if m.photo:
+        return "photo", m.photo[-1].file_id
+    if m.video:
+        return "video", m.video.file_id
+    if m.audio:
+        return "audio", m.audio.file_id
+    if m.voice:
+        return "voice", m.voice.file_id
+    if m.document:
+        return "document", m.document.file_id
+    return None, None
+
+
+async def send_panel(bot, chat_id: int, st: dict):
+    """Send the file as a NEW message with the current caption and buttons."""
+    cap = render(st) or None
+    kw = {
+        "caption": cap,
+        "parse_mode": ParseMode.HTML if cap else None,
+        "reply_markup": keyboard(st),
+    }
+    kind, fid = st["kind"], st["file_id"]
+    if kind == "animation":
+        return await bot.send_animation(chat_id, fid, **kw)
+    if kind == "photo":
+        return await bot.send_photo(chat_id, fid, **kw)
+    if kind == "video":
+        return await bot.send_video(chat_id, fid, supports_streaming=True, **kw)
+    if kind == "audio":
+        return await bot.send_audio(chat_id, fid, **kw)
+    if kind == "voice":
+        return await bot.send_voice(chat_id, fid, **kw)
+    return await bot.send_document(chat_id, fid, **kw)
+
+
+async def replace_panel(context, chat_id: int, old_mid: int, st: dict):
+    """Show the updated panel as a fresh message (so Telegram does not add an
+    'edited' label) and remove the old one."""
+    sent = await send_panel(context.bot, chat_id, st)
+    old_key = key_of(chat_id, old_mid)
+    new_key = key_of(chat_id, sent.message_id)
+
+    store(context).pop(old_key, None)
+    remember(context, new_key, st)
+
+    pending = context.user_data.get("pending")
+    if pending and pending.get("key") == old_key:
+        pending["key"] = new_key
+
     try:
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=render(st),
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard(st),
-        )
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+        await context.bot.delete_message(chat_id, old_mid)
+    except BadRequest:
+        pass
+    return sent
 
 
 # ---------- commands ----------
@@ -209,6 +254,9 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.message
+    kind, file_id = media_of(m)
+    if kind is None:
+        return
     st = {
         "orig": m.caption_html or "",
         "rm_id": False,
@@ -216,33 +264,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "rm_tag": False,
         "text": "",
         "pos": "bottom",
+        "kind": kind,
+        "file_id": file_id,
     }
-    kw = {
-        "caption": render(st) or None,
-        "parse_mode": ParseMode.HTML,
-        "reply_markup": keyboard(st),
-    }
-    chat = m.chat_id
-
     try:
-        # Animation must be checked before document (a GIF is also a document).
-        if m.animation:
-            sent = await context.bot.send_animation(chat, m.animation.file_id, **kw)
-        elif m.photo:
-            sent = await context.bot.send_photo(chat, m.photo[-1].file_id, **kw)
-        elif m.video:
-            sent = await context.bot.send_video(
-                chat, m.video.file_id, supports_streaming=True, **kw
-            )
-        elif m.audio:
-            sent = await context.bot.send_audio(chat, m.audio.file_id, **kw)
-        elif m.voice:
-            sent = await context.bot.send_voice(chat, m.voice.file_id, **kw)
-        elif m.document:
-            sent = await context.bot.send_document(chat, m.document.file_id, **kw)
-        else:
-            return
-        remember(context, key_of(chat, sent.message_id), st)
+        sent = await send_panel(context.bot, m.chat_id, st)
+        remember(context, key_of(m.chat_id, sent.message_id), st)
     except BadRequest as e:
         log.warning("BadRequest: %s", e)
         await m.reply_text(
@@ -264,6 +291,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if st is None:
         await q.answer("This panel is no longer active. Send the file again.", show_alert=True)
+        return
+
+    if "kind" not in st:
+        await q.answer("This panel is from an older version. Send the file again.", show_alert=True)
         return
 
     if action == "done":
@@ -308,17 +339,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
 
+    if new == st:
+        await q.answer("Nothing to change.")
+        return
+
     if too_long(render(new)):
         await q.answer("That would push the caption past 1024 characters.", show_alert=True)
         return
 
-    store(context)[key] = new
     try:
-        await refresh(context.bot, msg.chat_id, msg.message_id, new)
         await q.answer()
+        await replace_panel(context, msg.chat_id, msg.message_id, new)
     except BadRequest as e:
-        log.warning("Edit failed: %s", e)
-        await q.answer("Couldn't update the caption.", show_alert=True)
+        log.warning("Resend failed: %s", e)
+        await msg.reply_text("Couldn't update the caption.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -341,11 +375,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("That would push the caption past 1024 characters. Try something shorter.")
         return
 
-    store(context)[pending["key"]] = new
     try:
-        await refresh(context.bot, int(chat_id), int(msg_id), new)
+        await replace_panel(context, int(chat_id), int(msg_id), new)
     except BadRequest as e:
-        log.warning("Edit failed: %s", e)
+        log.warning("Resend failed: %s", e)
         await m.reply_text("Couldn't update the caption.")
         return
 
